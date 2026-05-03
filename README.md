@@ -1,86 +1,43 @@
-# Google-Maps-Scrapper
-This Python script utilizes the Playwright library to perform web scraping and data extraction from Google Maps. It is particularly designed for obtaining information about businesses, including their name, address, website, phone number, reviews, and more.
+# Website Gap Lead Finder
 
-To do a custom web scraping project you can find me on Upwork
+Desktop lead finder for web developers and agencies. It opens Google Maps, searches business categories by location, keeps only businesses that do not show a website, and exports outreach-ready contact data.
 
-<a href="https://www.upwork.com/freelancers/~01dbb4d47d167c2d43" target="_blank">
-<img src=https://img.shields.io/badge/Upwork-6FDA44?&style=for-the-badge&logo=medium&logoColor=white alt=medium style="margin-bottom: 5px;" />
-</a>
+## Output files
 
-## Table of Contents
-- [Prerequisites](#prerequisites)
-- [Key Features](#key-features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Example](#example)
-- [Notes](#notes)
-- [Video Example](#video-example)
+- `final_leads.csv` in the project root: client-ready rows with `lead_id`, `phone_number`, `profession`, `store_title`, and `email`.
+- `logs/leads_full_database.csv`: full lead record for deal tracking, including ID, name, category, address, Google Maps URL, reviews, description, query, and scrape time.
+- `logs/scraper.log`: runtime log for debugging failed searches.
 
-## Prerequisites
-- Python 3.8 or 3.9 (Python 3.10+ may not be compatible with some dependencies)
-- Google Chrome or Chromium browser installed (for Playwright)
+Every contact gets a stable `GM-...` lead ID. Phone numbers are normalized before saving, so the same number is written only once across later runs too. Use the lead ID in `logs/leads_full_database.csv` to find the Google Maps URL and study a client before a deal.
 
-## Key Features
-- Data Scraping: The script scrapes data from Google Maps listings, extracting valuable information about businesses, such as their name, address, website, and contact details.
-
-- Review Analysis: It extracts review counts and average ratings, providing insights into businesses' online reputation.
-
-- Business Type Detection: The script identifies whether a business offers in-store shopping, in-store pickup, or delivery services.
-
-- Operating Hours: It extracts information about the business's operating hours.
-
-- Introduction Extraction: The script also scrapes introductory information about the businesses when available.
-
-- Data Cleansing: It cleanses and organizes the scraped data, removing redundant or unnecessary columns.
-
-- CSV Export: The cleaned data is exported to a CSV file for further analysis or integration with other tools.
-
-## Installation
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/zohaibbashir/Google-Maps-Scrapper.git
-   cd google-maps-scraper
-   ```
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Install Playwright browsers:
-   ```bash
-   playwright install
-   ```
-
-## Usage
-
-Run the script with your desired search term and number of results:
+## Setup
 
 ```bash
-python main.py -s "Turkish Restaurants in Toronto Canada" -t 20
+pip install -r requirements.txt
+playwright install chromium
 ```
 
-- `-s` or `--search`: Search query for Google Maps (default: "turkish stores in toronto Canada")
-- `-t` or `--total`: Number of results to scrape (default: 1)
-- `-o` or `--output`: Output CSV file path (default: result.csv)
-- `--append`: Append results to the output file instead of overwriting (default: off)
+## Run
 
-## Example
-
-Append new results to an existing CSV file:
 ```bash
-python main.py -s "Turkish Restaurants in Toronto Canada" -t 20 -o toronto_turkish_restaurants.csv --append
+python app.py
 ```
 
-The script will launch a browser, perform the search, and start scraping information. Progress will be displayed in the terminal, and results will be saved to the specified CSV file. If `--append` is used, new results will be added to the end of the file without removing previous data.
+Use a business type like `Restaurants` or `Dentists`, add one or more locations separated by commas, and click `Find Leads`.
 
-## Notes
-- The script opens a visible browser window (not headless) for scraping.
-- Google Maps DOM may change, which can break the script. If you encounter issues, update the XPaths in `main.py`.
-- Avoid running too many scrapes in a short period to prevent being blocked by Google.
+## Project Structure
 
-## Video Example
+```text
+app.py                    # Small launcher
+ui/app_window.py          # CustomTkinter desktop UI
+backend/config.py         # Paths, defaults, suggestions
+backend/models.py         # Lead model and export row helpers
+backend/identity.py       # Stable ID and phone/email normalization
+backend/deduplication.py  # Duplicate filtering by phone/email
+backend/scraper.py        # Google Maps Playwright scraper
+backend/storage.py        # CSV export and existing-file checks
+backend/logging_config.py # Runtime logging setup
+logs/                     # Full lead database and scraper logs at runtime
+```
 
-https://www.linkedin.com/posts/zohaibbashir_python-data-webscraping-activity-7093920891411062784-flEQ
-
-## License
-MIT
+Use this responsibly and follow the rules of the sites and regions you operate in.
