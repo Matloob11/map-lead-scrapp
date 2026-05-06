@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import os
 import platform
 import re
+import threading
 import urllib.parse
 from typing import Callable, Optional
 
@@ -13,17 +15,41 @@ from .config import GOOGLE_MAPS_URL
 from .models import Lead
 from .session_cache import get_seen_urls, mark_url_seen
 
-import threading
+
+RESULT_SELECTOR = 'a.hfpxzc, a[href*="/maps/place"]'
+EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+NOISE_EMAIL_DOMAINS = {
+    "google.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "schema.org",
+}
+TIME_TOKEN_PATTERN = r"(?:1[0-2]|0?\d)(?::[0-5]\d)?\s*(?:AM|PM)"
+TIME_RANGE_PATTERN = re.compile(
+    rf"({TIME_TOKEN_PATTERN})\s*(?:-|[\u2013\u2014]|to)\s*({TIME_TOKEN_PATTERN})",
+    re.IGNORECASE,
+)
+DAY_MARKER_PATTERN = re.compile(
+    r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Today)",
+    re.IGNORECASE,
+)
+_WEBSITE_VERIFICATION_CACHE: dict[str, bool] = {}
+_WEBSITE_VERIFICATION_LOCK = threading.Lock()
+
 
 class ScraperControl:
     def __init__(self, on_auto_pause: Optional[Callable] = None):
         self._pause_event = threading.Event()
         self._pause_event.set()
         self._stop_event = threading.Event()
+        self._stop_reason = ""
         self.on_auto_pause = on_auto_pause
 
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
+
+    def stop_reason(self) -> str:
+        return self._stop_reason
 
     def wait_if_paused(self):
         self._pause_event.wait()
@@ -39,34 +65,26 @@ class ScraperControl:
     def resume(self):
         self._pause_event.set()
 
-    def stop(self):
+    def stop(self, reason: str = "manual"):
+        self._stop_reason = reason
         self._stop_event.set()
-        self._pause_event.set() # Unpause to let it terminate
-
-
-RESULT_SELECTOR = 'a.hfpxzc, a[href*="/maps/place"]'
-EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-NOISE_EMAIL_DOMAINS = {
-    "google.com",
-    "gstatic.com",
-    "googleusercontent.com",
-    "schema.org",
-}
+        self._pause_event.set()
 
 
 def run_single_search(
-    query: str, 
-    total: Optional[int], 
-    on_lead_extracted: Callable[[Lead], None] = None,
+    query: str,
+    target_saved: Optional[int],
+    on_lead_extracted: Optional[Callable[[Lead], bool]] = None,
     control: Optional[ScraperControl] = None,
-    headless: bool = False
+    headless: bool = False,
 ) -> list[Lead]:
     if control and control.is_stopped():
         return []
-    if total is not None and total <= 0:
+    if target_saved is not None and target_saved <= 0:
         return []
 
     leads: list[Lead] = []
+    accepted_count = 0
 
     with sync_playwright() as playwright:
         browser = _launch_browser(playwright, headless=headless)
@@ -88,10 +106,19 @@ def run_single_search(
 
             if search_mode == "single_place":
                 lead = extract_place(page, query)
+                if lead.business_name and not lead.has_website:
+                    verified_has_website = _verify_website_via_google_search(
+                        page,
+                        lead.business_name,
+                        lead.address,
+                        control,
+                    )
+                    if verified_has_website:
+                        lead.has_website = True
                 if lead.business_name and lead.is_target:
-                    leads.append(lead)
-                    if on_lead_extracted:
-                        on_lead_extracted(lead)
+                    accepted = _accept_extracted_lead(lead, leads, on_lead_extracted)
+                    if accepted:
+                        accepted_count += 1
                     logging.info(
                         "Single place target found: %s | %s | Phone: %s | Email: %s | URL: %s",
                         lead.lead_id,
@@ -109,11 +136,8 @@ def run_single_search(
             already_done = len(global_seen_links)
             if already_done:
                 logging.info("Resuming '%s': skipping %d already-processed URLs.", query, already_done)
-            extracted_count = 0
             stagnant_rounds = 0
-            
-            # Using 500 max scrolls as a generous upper limit for infinite search
-            max_scrolls = 500 if total is None else 500
+            max_scrolls = 2000
 
             for _ in range(max_scrolls):
                 if control:
@@ -130,12 +154,16 @@ def run_single_search(
                         control.wait_if_paused()
                         if control.is_stopped():
                             break
-                    
-                    if total is not None and extracted_count >= total:
+
+                    if (
+                        target_saved is not None
+                        and on_lead_extracted is None
+                        and accepted_count >= target_saved
+                    ):
                         break
 
                     global_seen_links.add(place_link)
-                    
+
                     try:
                         details_page.goto(place_link, wait_until="domcontentloaded", timeout=60000)
                         details_page.wait_for_selector("h1.DUwDvf", timeout=15000)
@@ -146,10 +174,13 @@ def run_single_search(
                             mark_url_seen(query, place_link)
                             continue
 
-                        # Professional Double Verification:
-                        # If Google Maps doesn't list a website, search Google to make absolutely sure.
                         if not lead.has_website:
-                            verified_has_website = _verify_website_via_google_search(details_page, lead.business_name, lead.address, control)
+                            verified_has_website = _verify_website_via_google_search(
+                                details_page,
+                                lead.business_name,
+                                lead.address,
+                                control,
+                            )
                             if verified_has_website:
                                 lead.has_website = True
 
@@ -160,9 +191,9 @@ def run_single_search(
                                 lead.map_link,
                             )
                         else:
-                            leads.append(lead)
-                            if on_lead_extracted:
-                                on_lead_extracted(lead)
+                            accepted = _accept_extracted_lead(lead, leads, on_lead_extracted)
+                            if accepted:
+                                accepted_count += 1
                             logging.info(
                                 "Target found: %s | %s | Phone: %s | Email: %s | URL: %s",
                                 lead.lead_id,
@@ -171,15 +202,18 @@ def run_single_search(
                                 lead.email or "-",
                                 lead.map_link,
                             )
-                        
+
                         mark_url_seen(query, place_link)
-                        extracted_count += 1
                     except Exception as exc:
                         logging.warning("Failed to extract listing for %s: %s", query, exc)
 
-                if total is not None and extracted_count >= total:
+                if (
+                    target_saved is not None
+                    and on_lead_extracted is None
+                    and accepted_count >= target_saved
+                ):
                     break
-                    
+
                 if control and control.is_stopped():
                     break
 
@@ -211,6 +245,7 @@ def extract_place(page: Page, search_query: str) -> Lead:
     website = _first_attr(page, ['a[data-item-id="authority"]'], "href")
     if not website:
         website = _first_text(page, ['a[data-item-id="authority"] .Io6YTe'])
+    opening_time, closing_time, hours_summary = _extract_business_hours(page)
 
     lead = Lead(
         business_name=_first_text(page, ["h1.DUwDvf"]),
@@ -244,6 +279,9 @@ def extract_place(page: Page, search_query: str) -> Lead:
         reviews_count=_extract_reviews_count(page),
         reviews_average=_extract_reviews_average(page),
         description=_first_text(page, [".PYvSYb", ".WeS02d"]),
+        opening_time=opening_time,
+        closing_time=closing_time,
+        hours_summary=hours_summary,
         search_query=search_query,
     )
     lead.finalize_identity()
@@ -263,16 +301,38 @@ def _launch_browser(playwright, headless: bool = False):
 
     return playwright.chromium.launch(**launch_kwargs)
 
-def _verify_website_via_google_search(page: Page, business_name: str, address: str, control: Optional[ScraperControl] = None) -> bool:
-    """Returns True if a likely official website is found via Google Search."""
+
+def _accept_extracted_lead(
+    lead: Lead,
+    leads: list[Lead],
+    on_lead_extracted: Optional[Callable[[Lead], bool]] = None,
+) -> bool:
+    leads.append(lead)
+    if on_lead_extracted:
+        return bool(on_lead_extracted(lead))
+    return bool(lead.has_contact)
+
+
+def _verify_website_via_google_search(
+    page: Page,
+    business_name: str,
+    address: str,
+    control: Optional[ScraperControl] = None,
+) -> bool:
+    cache_key = _website_verification_cache_key(business_name, address)
+    if cache_key:
+        with _WEBSITE_VERIFICATION_LOCK:
+            if cache_key in _WEBSITE_VERIFICATION_CACHE:
+                return _WEBSITE_VERIFICATION_CACHE[cache_key]
+
     while True:
         try:
             location_part = address if address else ""
             search_query = f"{business_name} {location_part}".strip()
             url = "https://www.google.com/search?q=" + urllib.parse.quote(search_query)
-            
+
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            
+
             try:
                 page.wait_for_selector("div#search", timeout=10000)
             except Exception:
@@ -280,46 +340,73 @@ def _verify_website_via_google_search(page: Page, business_name: str, address: s
                     control.trigger_auto_pause("Google Search blocked (CAPTCHA). Please solve in browser and click Resume.")
                     control.wait_if_paused()
                     if control.is_stopped():
+                        _cache_website_verification(cache_key, False)
                         return False
-                    continue # Retry after resume
+                    continue
+                _cache_website_verification(cache_key, False)
                 return False
-                
+
             links = page.locator("div#search a").evaluate_all("elements => elements.map(e => e.href)")
-        
+
             ignore_domains = [
-                "facebook.com", "instagram.com", "yelp.com", "yellowpages.com", 
-                "linkedin.com", "twitter.com", "tiktok.com", "mapquest.com", 
-                "foursquare.com", "zoominfo.com", "tripadvisor.com", "justdial.com",
-                "indiamart.com", "pinterest.com", "youtube.com", "trustpilot.com", 
-                "glassdoor.com", "bbb.org", "chamberofcommerce.com", "whatsapp.com",
-                "zomato.com", "swiggy.com", "ubereats.com", "doordash.com", "grubhub.com",
-                "yellowbot.com", "manta.com", "angi.com", "houzz.com"
+                "facebook.com",
+                "instagram.com",
+                "yelp.com",
+                "yellowpages.com",
+                "linkedin.com",
+                "twitter.com",
+                "tiktok.com",
+                "mapquest.com",
+                "foursquare.com",
+                "zoominfo.com",
+                "tripadvisor.com",
+                "justdial.com",
+                "indiamart.com",
+                "pinterest.com",
+                "youtube.com",
+                "trustpilot.com",
+                "glassdoor.com",
+                "bbb.org",
+                "chamberofcommerce.com",
+                "whatsapp.com",
+                "zomato.com",
+                "swiggy.com",
+                "ubereats.com",
+                "doordash.com",
+                "grubhub.com",
+                "yellowbot.com",
+                "manta.com",
+                "angi.com",
+                "houzz.com",
             ]
-            
+
             valid_links_checked = 0
             for href in links:
                 if not href or not href.startswith("http"):
                     continue
-                    
+
                 if "google." in href:
                     continue
-                    
+
                 try:
                     domain = href.split("/")[2].lower().replace("www.", "")
-                    
+
                     is_noise = any(noise in domain for noise in ignore_domains)
                     if not is_noise:
+                        _cache_website_verification(cache_key, True)
                         return True
-                        
+
                     valid_links_checked += 1
                     if valid_links_checked >= 4:
                         break
                 except Exception:
                     pass
-                    
+
+            _cache_website_verification(cache_key, False)
             return False
-        except Exception as e:
-            logging.warning("Verification search failed: %s", e)
+        except Exception as exc:
+            logging.warning("Verification search failed: %s", exc)
+            _cache_website_verification(cache_key, False)
             return False
 
 
@@ -350,6 +437,185 @@ def _open_search_results(page: Page, query: str, control: Optional[ScraperContro
                 logging.warning("No map results were found for %s", query)
                 return "empty"
 
+
+def _extract_business_hours(page: Page) -> tuple[str, str, str]:
+    raw_texts = _collect_hours_texts(page)
+    opening_time, closing_time = _parse_hours_from_texts(raw_texts)
+    if opening_time or closing_time:
+        return opening_time, closing_time, " | ".join(raw_texts)
+
+    button = page.locator('button[data-item-id="oh"]').first
+    opened_panel = False
+    try:
+        if button.count() > 0:
+            button.click(timeout=1500)
+            page.wait_for_timeout(600)
+            opened_panel = True
+            raw_texts.extend(_collect_hours_rows(page))
+    except Exception:
+        pass
+    finally:
+        if opened_panel:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    unique_texts = [value for value in dict.fromkeys(raw_texts) if value]
+    opening_time, closing_time = _parse_hours_from_texts(unique_texts)
+    return opening_time, closing_time, " | ".join(unique_texts)
+
+
+def _collect_hours_texts(page: Page) -> list[str]:
+    selectors = [
+        ('button[data-item-id="oh"]', "aria-label"),
+        ('button[data-item-id="oh"]', None),
+        ('div[aria-label*="Hours"]', "aria-label"),
+        ('div[aria-label*="Hours"]', None),
+        ('button[aria-label*="open hours"]', "aria-label"),
+        ('button[aria-label*="Open"]', "aria-label"),
+        ('button[aria-label*="Closed"]', "aria-label"),
+        ('button[aria-label*="Closes"]', "aria-label"),
+        ('button[aria-label*="Opens"]', "aria-label"),
+    ]
+
+    values: list[str] = []
+    for selector, attribute in selectors:
+        extracted_values = (
+            _extract_attr_values(page, selector, attribute)
+            if attribute
+            else _extract_text_values(page, selector)
+        )
+        for value in extracted_values:
+            normalized = _squash_whitespace(value)
+            if normalized and "suggest an edit" not in normalized.lower():
+                values.append(normalized)
+
+    return [value for value in dict.fromkeys(values) if value]
+
+
+def _collect_hours_rows(page: Page) -> list[str]:
+    selectors = [
+        "table.eK4R0e tr",
+        "div[role='dialog'] table tr",
+        "table tr",
+    ]
+
+    row_texts: list[str] = []
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+        except Exception:
+            continue
+
+        if count <= 0:
+            continue
+
+        for index in range(min(count, 10)):
+            try:
+                text = _squash_whitespace(locator.nth(index).inner_text(timeout=1000))
+            except Exception:
+                continue
+            if text:
+                row_texts.append(text)
+
+        if row_texts:
+            break
+
+    return row_texts
+
+
+def _parse_hours_from_texts(texts: list[str]) -> tuple[str, str]:
+    if not texts:
+        return "", ""
+
+    today_name = datetime.now().strftime("%A")
+    for text in texts:
+        opening_time, closing_time = _parse_day_hours_segment(text, today_name)
+        if opening_time or closing_time:
+            return opening_time, closing_time
+
+    for text in texts:
+        opening_time, closing_time = _parse_time_range(text)
+        if opening_time or closing_time:
+            return opening_time, closing_time
+
+    for text in texts:
+        lower_text = text.lower()
+        if "24 hours" in lower_text:
+            return "12:00 AM", "11:59 PM"
+
+        open_match = re.search(rf"opens?\s+({TIME_TOKEN_PATTERN})", text, re.IGNORECASE)
+        close_match = re.search(rf"closes?\s+({TIME_TOKEN_PATTERN})", text, re.IGNORECASE)
+        if open_match or close_match:
+            return (
+                _normalize_time_token(open_match.group(1)) if open_match else "",
+                _normalize_time_token(close_match.group(1)) if close_match else "",
+            )
+
+    return "", ""
+
+
+def _parse_day_hours_segment(text: str, today_name: str) -> tuple[str, str]:
+    normalized = _squash_whitespace(text)
+    if not normalized:
+        return "", ""
+
+    for marker in (today_name, "Today"):
+        pattern = re.compile(
+            rf"{marker}\s*:?\s*(.*?)(?=(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Today)\b|$)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(normalized)
+        if not match:
+            continue
+
+        segment = match.group(1).strip(" .")
+        if "24 hours" in segment.lower():
+            return "12:00 AM", "11:59 PM"
+        return _parse_time_range(segment)
+
+    if DAY_MARKER_PATTERN.search(normalized):
+        return "", ""
+    return _parse_time_range(normalized)
+
+
+def _parse_time_range(text: str) -> tuple[str, str]:
+    matches = TIME_RANGE_PATTERN.findall(text or "")
+    if not matches:
+        return "", ""
+
+    opening_time = _normalize_time_token(matches[0][0])
+    closing_time = _normalize_time_token(matches[-1][1])
+    return opening_time, closing_time
+
+
+def _normalize_time_token(value: str) -> str:
+    cleaned = _squash_whitespace(value).upper().replace(".", "")
+    match = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*([AP]M)$", cleaned)
+    if not match:
+        return cleaned
+
+    hours = int(match.group(1))
+    minutes = match.group(2) or "00"
+    meridiem = match.group(3)
+    return f"{hours}:{minutes} {meridiem}"
+
+
+def _website_verification_cache_key(business_name: str, address: str) -> str:
+    normalized_name = _squash_whitespace((business_name or "").lower())
+    normalized_address = _squash_whitespace((address or "").lower())
+    if not normalized_name:
+        return ""
+    return f"{normalized_name}|{normalized_address}"
+
+
+def _cache_website_verification(cache_key: str, value: bool) -> None:
+    if not cache_key:
+        return
+    with _WEBSITE_VERIFICATION_LOCK:
+        _WEBSITE_VERIFICATION_CACHE[cache_key] = value
 
 
 def _read_place_links(page: Page) -> list[str]:
@@ -426,6 +692,36 @@ def _extract_attr(page: Page, selector: str, attribute: str) -> str:
     except Exception:
         return ""
     return ""
+
+
+def _extract_text_values(page: Page, selector: str, limit: int = 8) -> list[str]:
+    values: list[str] = []
+    try:
+        locator = page.locator(selector)
+        count = min(locator.count(), limit)
+        for index in range(count):
+            text = locator.nth(index).inner_text(timeout=1500)
+            normalized = _squash_whitespace(text)
+            if normalized:
+                values.append(normalized)
+    except Exception:
+        return []
+    return values
+
+
+def _extract_attr_values(page: Page, selector: str, attribute: str, limit: int = 8) -> list[str]:
+    values: list[str] = []
+    try:
+        locator = page.locator(selector)
+        count = min(locator.count(), limit)
+        for index in range(count):
+            value = locator.nth(index).get_attribute(attribute, timeout=1500)
+            normalized = _squash_whitespace(value or "")
+            if normalized:
+                values.append(normalized)
+    except Exception:
+        return []
+    return values
 
 
 def _extract_email_from_panel(page: Page) -> str:

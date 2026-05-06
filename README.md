@@ -4,8 +4,10 @@ Desktop lead finder for web developers and agencies. It opens Google Maps, searc
 
 ## Output files
 
-- `final_leads.csv` in the project root: client-ready rows with `lead_id`, `phone_number`, `profession`, `store_title`, and `email`.
-- `logs/leads_full_database.csv`: full lead record for deal tracking, including ID, name, category, address, Google Maps URL, reviews, description, query, and scrape time.
+- `final_leads.csv` in the project root: client-ready rows with lead ID, business name, profession, phone, email, opening time, closing time, Map URL, and search query.
+- `morning_leads.csv` in the project root: saved leads whose opening time is before 12:00 PM.
+- `evening_leads.csv` in the project root: saved leads whose opening time is 12:00 PM or later.
+- `logs/leads_full_database.csv`: full lead record for deal tracking, including ID, name, category, address, Google Maps URL, reviews, description, opening/closing hours, query, and scrape time.
 - `logs/scraper.log`: runtime log for debugging failed searches.
 
 Every contact gets a stable `GM-...` lead ID. Phone numbers are normalized before saving, so the same number is written only once across later runs too. Use the lead ID in `logs/leads_full_database.csv` to find the Google Maps URL and study a client before a deal.
@@ -23,7 +25,7 @@ playwright install chromium
 python app.py
 ```
 
-Use a business type like `Restaurants` or `Dentists`, add one or more locations separated by commas, and click `Find Leads`.
+Use one or more business keywords like `Restaurants, Cafes, Dentists`, add one or more locations separated by commas, set the number of saved leads you want, and click `Find Leads`.
 
 ## Project Structure
 

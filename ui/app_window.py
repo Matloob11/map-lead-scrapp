@@ -6,11 +6,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import customtkinter as ctk
 from tkinter import ttk
 
-from backend.config import DEFAULT_MAX_RESULTS, DEFAULT_WORKERS, SUGGESTED_BUSINESS_TYPES
-
-from backend.scraper import run_single_search, ScraperControl
-from backend.storage import IncrementalLeadSaver
-from backend.session_cache import get_seen_urls, clear_query, clear_all, summary as cache_summary
+from backend.config import (
+    ALERT_AUDIO_FILE,
+    DEFAULT_MAX_RESULTS,
+    DEFAULT_WORKERS,
+    SUGGESTED_BUSINESS_TYPES,
+)
+from backend.query_builder import build_search_queries, parse_keywords
+from backend.scraper import ScraperControl, run_single_search
+from backend.session_cache import clear_all, clear_query, get_seen_urls
+from backend.storage import IncrementalLeadSaver, SaveResult
 
 
 class App(ctk.CTk):
@@ -18,8 +23,8 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Website Gap Lead Finder")
-        self.geometry("1080x740")
-        self.minsize(900, 660)
+        self.geometry("1180x760")
+        self.minsize(980, 680)
 
         self.scraper_control = None
         self._is_paused = False
@@ -42,8 +47,8 @@ class App(ctk.CTk):
 
         self.search_entry = ctk.CTkEntry(
             self,
-            placeholder_text="Business type, e.g. Restaurants, Plumbers, Dentists",
-            width=560,
+            placeholder_text="Business keywords, comma separated, e.g. restaurants, cafes, plumbers",
+            width=620,
             height=42,
         )
         self.search_entry.pack(pady=8)
@@ -51,7 +56,7 @@ class App(ctk.CTk):
 
         self.suggestions_frame = ctk.CTkScrollableFrame(
             self,
-            width=540,
+            width=600,
             height=150,
             fg_color="#111827",
             corner_radius=6,
@@ -72,7 +77,7 @@ class App(ctk.CTk):
         )
         self.loc_entry.grid(row=0, column=1, padx=14, pady=(14, 8), sticky="ew")
 
-        self.results_label = ctk.CTkLabel(self.settings_frame, text="Max results per location")
+        self.results_label = ctk.CTkLabel(self.settings_frame, text="Target saved leads")
         self.results_label.grid(row=1, column=0, padx=14, pady=8, sticky="w")
 
         self.results_entry = ctk.CTkEntry(self.settings_frame, width=110, height=34)
@@ -88,9 +93,9 @@ class App(ctk.CTk):
 
         self.headless_label = ctk.CTkLabel(self.settings_frame, text="Background Mode (Headless)")
         self.headless_label.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="w")
-        
+
         self.headless_switch = ctk.CTkSwitch(self.settings_frame, text="", width=50)
-        self.headless_switch.select() # Default to Headless mode ON for performance
+        self.headless_switch.select()
         self.headless_switch.grid(row=3, column=1, padx=14, pady=(0, 14), sticky="w")
 
         self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -146,7 +151,7 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(self, text="", text_color="#cbd5e1")
         self.status_label.pack(pady=(2, 0))
 
-        self.progress_bar = ctk.CTkProgressBar(self, width=560)
+        self.progress_bar = ctk.CTkProgressBar(self, width=620)
         self.progress_bar.set(0)
         self.progress_bar.pack(pady=10)
 
@@ -168,24 +173,37 @@ class App(ctk.CTk):
         )
         style.map("Treeview", background=[("selected", "#0f766e")])
 
-        columns = ("lead_id", "phone_number", "profession", "store_title", "email", "map_link")
+        columns = (
+            "lead_id",
+            "store_title",
+            "profession",
+            "phone_number",
+            "opening_time",
+            "closing_time",
+            "email",
+            "map_link",
+        )
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=12)
 
         headings = {
             "lead_id": "Lead ID",
-            "phone_number": "Phone",
-            "profession": "Profession",
             "store_title": "Store Title",
+            "profession": "Profession",
+            "phone_number": "Phone",
+            "opening_time": "Opens",
+            "closing_time": "Closes",
             "email": "Email",
             "map_link": "Map URL",
         }
         widths = {
             "lead_id": 130,
-            "phone_number": 140,
-            "profession": 150,
-            "store_title": 220,
+            "store_title": 210,
+            "profession": 180,
+            "phone_number": 135,
+            "opening_time": 90,
+            "closing_time": 90,
             "email": 180,
-            "map_link": 260,
+            "map_link": 240,
         }
 
         for col in columns:
@@ -195,7 +213,7 @@ class App(ctk.CTk):
         self.tree.pack(pady=10, padx=24, fill="both", expand=True)
 
     def check_suggestions(self, _event):
-        typed = self.search_entry.get().strip().lower()
+        typed = self._current_keyword_fragment(self.search_entry.get()).lower()
         if not typed:
             self.suggestions_frame.place_forget()
             return
@@ -228,89 +246,112 @@ class App(ctk.CTk):
         self.suggestions_frame.lift()
 
     def select_suggestion(self, value):
+        updated_value = self._replace_last_keyword_fragment(self.search_entry.get(), value)
         self.search_entry.delete(0, "end")
-        self.search_entry.insert(0, value)
+        self.search_entry.insert(0, updated_value)
         self.suggestions_frame.place_forget()
 
     def start_search(self):
-        query = self.search_entry.get().strip()
-        if not query:
-            self.set_status("Please enter a business type or search query.", "#f87171")
+        raw_keywords = self.search_entry.get().strip()
+        if not parse_keywords(raw_keywords):
+            self.set_status("Please enter at least one business keyword.", "#f87171")
             return
 
         try:
-            total_results_str = self.results_entry.get().strip()
-            total_results = int(total_results_str) if total_results_str else None
-            
+            target_saved_str = self.results_entry.get().strip()
+            target_saved = int(target_saved_str) if target_saved_str else None
+            if target_saved is not None and target_saved <= 0:
+                raise ValueError
+
             workers_str = self.threads_entry.get().strip()
             workers = int(workers_str) if workers_str else 1
-            workers = max(1, workers)
+            if workers <= 0:
+                raise ValueError
         except ValueError:
-            self.set_status("Results and browser workers must be valid numbers.", "#f87171")
+            self.set_status("Target saved leads and browser workers must be valid positive numbers.", "#f87171")
             return
 
         locations = self.parse_locations(self.loc_entry.get())
-        queries = [f"{query} in {location}" for location in locations] if locations else [query]
+        queries = build_search_queries(raw_keywords, locations)
+        if not queries:
+            self.set_status("No valid search queries could be built from the keywords provided.", "#f87171")
+            return
+
         workers = min(workers, len(queries))
-        
         is_headless = bool(self.headless_switch.get())
 
-        # Build resume hint
-        resume_hints = []
-        for q in queries:
-            seen = len(get_seen_urls(q))
-            if seen > 0:
-                resume_hints.append(f"'{q}': {seen} skipped")
-        resume_msg = f" (Resuming — {', '.join(resume_hints)})" if resume_hints else ""
+        resume_counts = [len(get_seen_urls(query)) for query in queries]
+        resumed_queries = sum(1 for count in resume_counts if count)
+        total_skipped = sum(resume_counts)
+        resume_msg = (
+            f" - resuming {resumed_queries} cached searches with {total_skipped} scanned URLs"
+            if resumed_queries
+            else ""
+        )
+        target_msg = f" until {target_saved} saved leads" if target_saved else ""
 
         self.search_button.configure(state="disabled")
         self.pause_button.configure(state="normal", text="Pause")
         self.stop_button.configure(state="normal")
-        
-        def on_auto_pause(msg):
-            self.after(0, lambda: self._handle_auto_pause(msg))
+
+        def on_auto_pause(message):
+            self.after(0, lambda: self._handle_auto_pause(message))
 
         self.scraper_control = ScraperControl(on_auto_pause=on_auto_pause)
         self._is_paused = False
-        
+
         self.progress_bar.set(0)
         self.clear_table()
-        self.set_status(f"Starting browser {'(Headless)' if is_headless else ''}{resume_msg} and collecting listings...", "#cbd5e1")
+        self.set_status(
+            f"Starting {len(queries)} map searches{target_msg}{resume_msg}...",
+            "#cbd5e1",
+        )
 
         thread = threading.Thread(
             target=self.run_scraping,
-            args=(queries, total_results, workers, is_headless),
+            args=(queries, target_saved, workers, is_headless),
             daemon=True,
         )
         thread.start()
 
-    def run_scraping(self, queries, total_results, workers, is_headless):
+    def run_scraping(self, queries, target_saved, workers, is_headless):
         started_at = time.time()
-        saver = IncrementalLeadSaver()
+        saver = IncrementalLeadSaver(max_saved=target_saved)
+        failed_queries: list[str] = []
 
         def on_lead_extracted(lead):
             saved = saver.save_lead(lead)
             if saved:
                 self.after(0, lambda: self.add_single_lead_to_table(lead))
-            self.after(0, lambda: self.set_status(
-                (
-                    f"Processing... Saved: {saver.saved_count} | "
-                    f"Duplicates: {saver.duplicate_count} | "
-                    f"Scanned: {saver.scanned_count}"
-                ),
+
+            if target_saved:
+                self.update_progress(min(saver.saved_count / target_saved, 1))
+
+            self.set_status(
+                self._build_processing_status(saver, target_saved),
                 "#cbd5e1",
-            ))
+            )
+
+            if (
+                target_saved
+                and saver.saved_count >= target_saved
+                and self.scraper_control
+                and not self.scraper_control.is_stopped()
+            ):
+                self.scraper_control.stop(reason="target_reached")
+
+            return saved
 
         try:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_query = {
                     executor.submit(
-                        run_single_search, 
-                        search_query, 
-                        total_results, 
+                        run_single_search,
+                        search_query,
+                        target_saved,
                         on_lead_extracted,
                         self.scraper_control,
-                        is_headless
+                        is_headless,
                     ): search_query
                     for search_query in queries
                 }
@@ -320,48 +361,66 @@ class App(ctk.CTk):
                     try:
                         future.result()
                     except Exception as exc:
+                        failed_queries.append(search_query)
                         logging.exception("Search failed for %s", search_query)
                         self.set_status(f"Search failed for {search_query}: {exc}", "#f87171")
 
-                    self.update_progress(completed / len(queries))
+                    if not target_saved:
+                        self.update_progress(completed / len(queries))
 
             duration = round(time.time() - started_at, 1)
+            stop_reason = self.scraper_control.stop_reason() if self.scraper_control else ""
+            result = saver.get_result()
+            failure_summary = self._build_failure_summary(failed_queries)
 
-            if self.scraper_control and self.scraper_control.is_stopped():
-                self.set_status(f"Search stopped manually. Saved: {saver.saved_count}", "#fbbf24")
-            elif saver.saved_count:
+            if stop_reason == "manual":
                 self.set_status(
-                    (
-                        f"Done in {duration}s. Saved {saver.saved_count} contacts "
-                        f"to {saver.final_path.name}. Study log: "
-                        f"{saver.full_log_path.as_posix()}."
-                    ),
-                    "#34d399",
+                    f"Search stopped manually. Saved {result.saved_count} leads.{failure_summary}",
+                    "#fbbf24",
                 )
-            elif saver.actionable_count:
+            elif result.saved_count:
+                if target_saved and result.saved_count >= target_saved:
+                    self.set_status(
+                        f"Done in {duration}s. Target reached with {result.saved_count}/{target_saved} saved leads. {self._build_export_summary(result)}{failure_summary}",
+                        "#34d399",
+                    )
+                else:
+                    target_text = f"{result.saved_count}/{target_saved}" if target_saved else str(result.saved_count)
+                    self.set_status(
+                        f"Done in {duration}s. Saved {target_text} leads. {self._build_export_summary(result)}{failure_summary}",
+                        "#34d399",
+                    )
+            elif result.actionable_count:
                 self.set_status(
                     (
                         "Done. Contacts were found, but every phone/email already exists. "
-                        f"Duplicates skipped: {saver.duplicate_count}."
+                        f"Duplicates skipped: {result.duplicate_count}.{failure_summary}"
                     ),
                     "#fbbf24",
                 )
             else:
-                self.set_status(
-                    "Done. No businesses without a website and phone/email were found.",
-                    "#fbbf24",
-                )
+                if target_saved:
+                    self.set_status(
+                        f"Done. Search exhausted before reaching {target_saved} saved leads.{failure_summary}",
+                        "#fbbf24",
+                    )
+                else:
+                    self.set_status(
+                        f"Done. No businesses without a website and phone/email were found.{failure_summary}",
+                        "#fbbf24",
+                    )
         finally:
             def reset_buttons():
                 self.search_button.configure(state="normal")
                 self.pause_button.configure(state="disabled", text="Pause")
                 self.stop_button.configure(state="disabled")
+
             self.after(0, reset_buttons)
 
     def toggle_pause(self):
         if not self.scraper_control:
             return
-            
+
         if self._is_paused:
             self.scraper_control.resume()
             self._is_paused = False
@@ -373,51 +432,50 @@ class App(ctk.CTk):
             self.pause_button.configure(text="Resume")
             self.set_status("Paused search...", "#fbbf24")
 
-    def _handle_auto_pause(self, msg):
+    def _handle_auto_pause(self, message):
         self._is_paused = True
         self.pause_button.configure(text="Resume")
-        self.set_status(msg, "#fbbf24")
-        
+        self.set_status(message, "#fbbf24")
+
         def play_sound():
             try:
-                import os
-                if os.path.exists("alert.mp3"):
+                if ALERT_AUDIO_FILE.exists():
                     import pygame
+
                     pygame.mixer.init()
-                    pygame.mixer.music.load("alert.mp3")
+                    pygame.mixer.music.load(str(ALERT_AUDIO_FILE))
                     pygame.mixer.music.play()
                 else:
                     import winsound
+
                     winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            except Exception as e:
-                import logging
-                logging.warning(f"Could not play sound: {e}")
-                
+            except Exception as exc:
+                logging.warning("Could not play sound: %s", exc)
+
         threading.Thread(target=play_sound, daemon=True).start()
 
     def stop_search(self):
         if self.scraper_control:
-            self.scraper_control.stop()
+            self.scraper_control.stop(reason="manual")
             self.set_status("Stopping search (waiting for current tasks to exit)...", "#ef4444")
             self.pause_button.configure(state="disabled")
             self.stop_button.configure(state="disabled")
 
     def clear_session_cache(self):
-        query = self.search_entry.get().strip()
+        raw_keywords = self.search_entry.get().strip()
         locations = self.parse_locations(self.loc_entry.get())
-        queries = [f"{query} in {loc}" for loc in locations] if locations else ([query] if query else [])
+        queries = build_search_queries(raw_keywords, locations) if raw_keywords else []
 
         if queries:
-            for q in queries:
-                clear_query(q)
+            for query in queries:
+                clear_query(query)
             self.set_status(
-                f"Cache cleared for {len(queries)} query(s). Next run will start fresh.",
+                f"Cache cleared for {len(queries)} query variation(s). Next run will start fresh.",
                 "#34d399",
             )
         else:
             clear_all()
             self.set_status("All session cache cleared. Next run will start fresh.", "#34d399")
-
 
     @staticmethod
     def parse_locations(raw_locations):
@@ -426,6 +484,49 @@ class App(ctk.CTk):
             for location in raw_locations.replace("\n", ",").split(",")
             if location.strip()
         ]
+
+    @staticmethod
+    def _current_keyword_fragment(raw_value: str) -> str:
+        index = max(raw_value.rfind(","), raw_value.rfind(";"), raw_value.rfind("\n"))
+        return raw_value[index + 1 :].strip() if index >= 0 else raw_value.strip()
+
+    @staticmethod
+    def _replace_last_keyword_fragment(raw_value: str, value: str) -> str:
+        index = max(raw_value.rfind(","), raw_value.rfind(";"), raw_value.rfind("\n"))
+        if index < 0:
+            return value
+
+        prefix = raw_value[: index + 1]
+        spacer = "" if prefix.endswith((" ", "\n")) else " "
+        return f"{prefix}{spacer}{value}"
+
+    @staticmethod
+    def _build_processing_status(saver: IncrementalLeadSaver, target_saved: int | None) -> str:
+        saved_text = f"{saver.saved_count}/{target_saved}" if target_saved else str(saver.saved_count)
+        return (
+            f"Processing... Saved: {saved_text} | Morning: {saver.morning_count} | "
+            f"Evening: {saver.evening_count} | Duplicates: {saver.duplicate_count} | "
+            f"Scanned: {saver.scanned_count}"
+        )
+
+    @staticmethod
+    def _build_export_summary(result: SaveResult) -> str:
+        summary = (
+            f"final_leads.csv updated. Morning: {result.morning_count} -> {result.morning_path.name}, "
+            f"Evening: {result.evening_count} -> {result.evening_path.name}."
+        )
+        if result.unknown_hours_count:
+            summary += f" Hours unavailable for {result.unknown_hours_count} lead(s)."
+        return summary
+
+    @staticmethod
+    def _build_failure_summary(failed_queries: list[str]) -> str:
+        if not failed_queries:
+            return ""
+        count = len(failed_queries)
+        sample = ", ".join(failed_queries[:2])
+        suffix = "..." if count > 2 else ""
+        return f" Failed queries: {count} ({sample}{suffix})."
 
     def set_status(self, text, color="#cbd5e1"):
         self.after(0, lambda: self.status_label.configure(text=text, text_color=color))
@@ -446,7 +547,6 @@ class App(ctk.CTk):
             self.add_single_lead_to_table(lead, "end")
 
     def add_single_lead_to_table(self, lead, index=0):
-        # If we have more than 100 items, maybe remove the last one
         if len(self.tree.get_children()) >= 100:
             last_item = self.tree.get_children()[-1]
             self.tree.delete(last_item)
@@ -456,9 +556,11 @@ class App(ctk.CTk):
             index,
             values=(
                 lead.lead_id,
-                lead.phone_number,
-                lead.profession,
                 lead.store_title,
+                lead.profession,
+                lead.phone_number,
+                lead.opening_time,
+                lead.closing_time,
                 lead.email,
                 lead.map_link,
             ),

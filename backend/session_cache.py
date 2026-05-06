@@ -16,7 +16,9 @@ import logging
 import threading
 from pathlib import Path
 
-_CACHE_FILE = Path(".scraper_session_cache.json")
+from .config import ROOT_DIR
+
+_CACHE_FILE = ROOT_DIR / ".scraper_session_cache.json"
 _lock = threading.Lock()
 
 
