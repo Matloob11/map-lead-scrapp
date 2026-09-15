@@ -1,16 +1,29 @@
 # Website Gap Lead Finder
 
-Desktop lead finder for web developers and agencies. It opens Google Maps, searches business categories by location, keeps only businesses that do not show a website, and exports outreach-ready contact data.
+Desktop tool for agencies: open Google Maps, search business categories by location, keep only places that **do not show a website**, and export outreach CSVs.
 
-## Output files
+## Output
 
-- `final_leads.csv` in the project root: client-ready rows with lead ID, business name, profession, phone, email, opening time, closing time, Map URL, and search query.
-- `morning_leads.csv` in the project root: saved leads whose opening time is before 12:00 PM.
-- `evening_leads.csv` in the project root: saved leads whose opening time is 12:00 PM or later.
-- `logs/leads_full_database.csv`: full lead record for deal tracking, including ID, name, category, address, Google Maps URL, reviews, description, opening/closing hours, query, and scrape time.
-- `logs/scraper.log`: runtime log for debugging failed searches.
+| File | Contents |
+| --- | --- |
+| `final_leads.csv` | Client-ready: lead ID, name, profession, phone, email, open/close, Maps URL, query |
+| `morning_leads.csv` | Opens before 12:00 |
+| `evening_leads.csv` | Opens at/after 12:00 |
+| `logs/leads_full_database.csv` | Full record (address, reviews, description, scrape time) |
+| `logs/scraper.log` | Runtime log |
 
-Every contact gets a stable `GM-...` lead ID. Phone numbers are normalized before saving, so the same number is written only once across later runs too. Use the lead ID in `logs/leads_full_database.csv` to find the Google Maps URL and study a client before a deal.
+Every contact gets a stable `GM-…` ID. Phones are normalized so the same number is stored once across later runs. Use the ID in the full database CSV to reopen the Maps URL.
+
+Default category suggestions in `backend/config.py` include restaurants, cafes, dentists, and similar local services.
+
+## Stack
+
+- Python
+- CustomTkinter (`ui/app_window.py`)
+- Playwright Chromium
+- pygame for the alert sound
+
+No `.env`.
 
 ## Setup
 
@@ -25,21 +38,26 @@ playwright install chromium
 python app.py
 ```
 
-Use one or more business keywords like `Restaurants, Cafes, Dentists`, add one or more locations separated by commas, set the number of saved leads you want, and click `Find Leads`.
+Enter one or more keywords (`Restaurants, Cafes, Dentists`), comma-separated locations, how many leads to save, then **Find Leads**.
 
-## Project Structure
+Follow Google Maps terms and local law. This is a research aid, not a license to scrape at scale.
+
+## Layout
 
 ```text
-app.py                    # Small launcher
-ui/app_window.py          # CustomTkinter desktop UI
-backend/config.py         # Paths, defaults, suggestions
-backend/models.py         # Lead model and export row helpers
-backend/identity.py       # Stable ID and phone/email normalization
-backend/deduplication.py  # Duplicate filtering by phone/email
-backend/scraper.py        # Google Maps Playwright scraper
-backend/storage.py        # CSV export and existing-file checks
-backend/logging_config.py # Runtime logging setup
-logs/                     # Full lead database and scraper logs at runtime
+app.py                    Launcher
+ui/app_window.py          CustomTkinter UI
+backend/config.py         Paths, defaults, suggestions
+backend/models.py         Lead model, export rows
+backend/identity.py       Stable ID, phone/email normalize
+backend/deduplication.py
+backend/scraper.py        Playwright Maps scraper
+backend/storage.py
+backend/logging_config.py
+alert/
+logs/
 ```
 
-Use this responsibly and follow the rules of the sites and regions you operate in.
+## License
+
+See `LICENSE`.
